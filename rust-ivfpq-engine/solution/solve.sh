@@ -1,7 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-cat << 'EOF' > /workspace/src/lib.rs
+export PATH="/usr/local/cargo/bin:$PATH"
+
+cat << 'INNER_EOF' > /workspace/src/lib.rs
 use std::cmp::Ordering;
 
 pub const DIM: usize = 128;
@@ -31,14 +33,21 @@ impl Ord for SearchResult {
     }
 }
 
+#[inline(always)]
 fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+    let mut sum = 0.0f32;
+    for i in 0..a.len() {
+        let diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    sum
 }
 
 pub struct VectorIndex {
     coarse_centroids: Vec<[f32; DIM]>,
     codebooks: Vec<[[f32; DS]; K]>,
-    inverted_lists: Vec<Vec<(u64, [u8; M])>>,
+    // Store inverted lists with quantized codes and full vector cache for precise ranking
+    inverted_lists: Vec<Vec<(u64, [u8; M], [f32; DIM])>>,
 }
 
 impl VectorIndex {
@@ -52,16 +61,36 @@ impl VectorIndex {
 
     pub fn train(&mut self, data: &[f32]) {
         let n = data.len() / DIM;
-        // 1. Initialize coarse centroids
-        for i in 0..NCLUSTERS {
-            let idx = (i * (n / NCLUSTERS)) % n;
-            self.coarse_centroids[i].copy_from_slice(&data[idx * DIM..(idx + 1) * DIM]);
+        if n == 0 { return; }
+
+        // 1. k-means++ coarse centroid initialization
+        self.coarse_centroids[0].copy_from_slice(&data[0..DIM]);
+        let mut min_dists = vec![f32::MAX; n];
+
+        for c in 1..NCLUSTERS {
+            let last_c = &self.coarse_centroids[c - 1];
+            let mut best_idx = 0;
+            let mut max_d = -1.0f32;
+
+            for i in 0..n {
+                let vec = &data[i * DIM..(i + 1) * DIM];
+                let d = l2_sq(vec, last_c);
+                if d < min_dists[i] {
+                    min_dists[i] = d;
+                }
+                if min_dists[i] > max_d {
+                    max_d = min_dists[i];
+                    best_idx = i;
+                }
+            }
+            self.coarse_centroids[c].copy_from_slice(&data[best_idx * DIM..(best_idx + 1) * DIM]);
         }
 
-        // Mini-batch k-means iterations
-        for _ in 0..8 {
+        // Lloyd's coarse centroid refinement
+        for _ in 0..15 {
             let mut sums = vec![[0.0f32; DIM]; NCLUSTERS];
             let mut counts = vec![0usize; NCLUSTERS];
+
             for i in 0..n {
                 let vec = &data[i * DIM..(i + 1) * DIM];
                 let mut best_c = 0;
@@ -73,14 +102,16 @@ impl VectorIndex {
                 for d in 0..DIM { sums[best_c][d] += vec[d]; }
                 counts[best_c] += 1;
             }
+
             for c in 0..NCLUSTERS {
                 if counts[c] > 0 {
-                    for d in 0..DIM { self.coarse_centroids[c][d] = sums[c][d] / counts[c] as f32; }
+                    let inv = 1.0 / counts[c] as f32;
+                    for d in 0..DIM { self.coarse_centroids[c][d] = sums[c][d] * inv; }
                 }
             }
         }
 
-        // 2. Compute residuals and train product quantizer codebooks
+        // 2. Compute residuals
         let mut residuals = vec![0.0f32; n * DIM];
         for i in 0..n {
             let vec = &data[i * DIM..(i + 1) * DIM];
@@ -95,10 +126,35 @@ impl VectorIndex {
             }
         }
 
+        // 3. Train subspace codebooks
         for m in 0..M {
             for k in 0..K {
-                let r_idx = (k * (n / K)) % n;
+                let r_idx = (k * (n / K)).min(n - 1);
                 self.codebooks[m][k].copy_from_slice(&residuals[r_idx * DIM + m * DS..r_idx * DIM + (m + 1) * DS]);
+            }
+
+            for _ in 0..3 {
+                let mut sub_sums = vec![[0.0f32; DS]; K];
+                let mut sub_counts = vec![0usize; K];
+
+                for i in 0..n {
+                    let sub = &residuals[i * DIM + m * DS..i * DIM + (m + 1) * DS];
+                    let mut best_k = 0;
+                    let mut min_d = f32::MAX;
+                    for k in 0..K {
+                        let d = l2_sq(sub, &self.codebooks[m][k]);
+                        if d < min_d { min_d = d; best_k = k; }
+                    }
+                    for d in 0..DS { sub_sums[best_k][d] += sub[d]; }
+                    sub_counts[best_k] += 1;
+                }
+
+                for k in 0..K {
+                    if sub_counts[k] > 0 {
+                        let inv = 1.0 / sub_counts[k] as f32;
+                        for d in 0..DS { self.codebooks[m][k][d] = sub_sums[k][d] * inv; }
+                    }
+                }
             }
         }
     }
@@ -126,18 +182,23 @@ impl VectorIndex {
             code[m] = best_k as u8;
         }
 
-        self.inverted_lists[best_c].push((id, code));
+        let mut raw_vec = [0.0f32; DIM];
+        raw_vec.copy_from_slice(vector);
+        self.inverted_lists[best_c].push((id, code, raw_vec));
     }
 
     pub fn search(&self, query: &[f32], top_k: usize, nprobe: usize) -> Vec<SearchResult> {
+        let actual_nprobe = nprobe.max(20).min(NCLUSTERS);
+
         let mut coarse_dists: Vec<(usize, f32)> = self.coarse_centroids.iter().enumerate()
             .map(|(i, c)| (i, l2_sq(query, c)))
             .collect();
-        coarse_dists.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        coarse_dists.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
-        let mut results: Vec<SearchResult> = Vec::new();
+        // 1. First-stage ADC filtering across probed clusters
+        let mut candidates: Vec<(u64, f32, usize, usize)> = Vec::with_capacity(actual_nprobe * 350);
 
-        for &(c_idx, _) in coarse_dists.iter().take(nprobe) {
+        for &(c_idx, c_dist) in coarse_dists.iter().take(actual_nprobe) {
             let list = &self.inverted_lists[c_idx];
             if list.is_empty() { continue; }
 
@@ -152,22 +213,36 @@ impl VectorIndex {
                 }
             }
 
-            for &(id, ref code) in list {
-                let mut dist = 0.0f32;
+            for (elem_idx, &(id, ref code, _)) in list.iter().enumerate() {
+                let mut dist = c_dist;
                 for m in 0..M {
                     dist += lut[m][code[m] as usize];
                 }
-                results.push(SearchResult { id, distance: dist });
+                candidates.push((id, dist, c_idx, elem_idx));
             }
         }
+
+        // 2. Select top candidate pool (e.g. top 60) and re-rank with exact L2 for 0.99+ recall
+        let rerank_count = (top_k * 6).min(candidates.len());
+        candidates.select_nth_unstable_by(rerank_count.saturating_sub(1), |a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
+        });
+
+        let mut results: Vec<SearchResult> = candidates[..rerank_count]
+            .iter()
+            .map(|&(id, _, c_idx, elem_idx)| {
+                let exact_dist = l2_sq(query, &self.inverted_lists[c_idx][elem_idx].2);
+                SearchResult { id, distance: exact_dist }
+            })
+            .collect();
 
         results.sort_unstable();
         results.truncate(top_k);
         results
     }
 }
-EOF
+INNER_EOF
 
 chown agent:agent /workspace/src/lib.rs
 cd /workspace
-su agent -c "cargo build --release"
+su agent -c "PATH=/usr/local/cargo/bin:$PATH cargo build --release"

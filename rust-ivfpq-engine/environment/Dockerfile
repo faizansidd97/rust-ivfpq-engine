@@ -25,7 +25,7 @@ RUN useradd -m -u 1000 -s /bin/bash agent && \
     chown -R agent:agent /workspace
 
 WORKDIR /workspace
-COPY --chown=agent:agent environment/workspace/ /workspace/
+COPY --chown=agent:agent workspace/ /workspace/
 
 # Pre-build dependencies under agent user so Cargo registry is cached offline
 USER agent

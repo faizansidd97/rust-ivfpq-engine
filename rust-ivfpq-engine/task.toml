@@ -3,16 +3,19 @@ version = "1.0"
 [task]
 name = "rust-ivfpq-engine"
 description = "Implement an in-memory Inverted File Product Quantization (IVF-PQ) vector search index in Rust."
+
+[metadata]
+difficulty = "hard"
 category = "Performance Optimisation"
 
-[limits]
-agent_timeout_seconds = 72000
-verifier_timeout_seconds = 600
-
-[resources]
-cpus = 4
-memory_gb = 8
+[agent]
+timeout_sec = 72000
 
 [verifier]
+timeout_sec = 600
 entrypoint = "tests/test.sh"
 reward_path = "/logs/verifier/reward.txt"
+
+[environment]
+cpus = 4
+memory_mb = 8192
